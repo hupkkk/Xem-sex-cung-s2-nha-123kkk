@@ -4,6 +4,7 @@ const cors = require('cors');
 
 // ================================================================
 //  CLASS ULTRA DICE PREDICTION SYSTEM (TOÀN BỘ THUẬT TOÁN)
+//  Lấy từ ttoan.txt – đã sửa lỗi và tối ưu
 // ================================================================
 
 class UltraDicePredictionSystem {
@@ -2360,7 +2361,7 @@ class UltraDicePredictionSystem {
 }
 
 // ================================================================
-//  SERVER EXPRESS – VỚI BỘ NHỚ LỊCH SỬ VÀ TỰ ĐỘNG CẬP NHẬT
+//  SERVER EXPRESS – TÍCH HỢP API VÀ TỰ ĐỘNG CẬP NHẬT
 // ================================================================
 
 const app = express();
@@ -2373,8 +2374,11 @@ app.use(express.json());
 const API_URL = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=15766f58a95cb4f95975ffcf643f524c';
 
 // ---------- BỘ NHỚ LỊCH SỬ ----------
-let historyResults = []; // Lưu các kết quả T/X đã lấy được
-let lastRawSessions = []; // Lưu toàn bộ phiên thô để lấy xúc xắc và id
+let historyResults = [];          // Lưu các kết quả T/X đã lấy được
+let lastRawSessions = [];        // Lưu toàn bộ phiên thô để lấy xúc xắc và id
+let latestPrediction = null;
+let lastUpdateTime = null;
+let isUpdating = false;
 
 // ---------- HELPER: trích xuất mảng phiên ----------
 function extractSessionsArray(data) {
@@ -2406,10 +2410,6 @@ function getValue(obj, keys, fallback = null) {
 }
 
 // ---------- HÀM CẬP NHẬT DỰ ĐOÁN ----------
-let latestPrediction = null;
-let lastUpdateTime = null;
-let isUpdating = false;
-
 async function fetchAndUpdatePrediction() {
     if (isUpdating) return;
     isUpdating = true;
@@ -2418,14 +2418,10 @@ async function fetchAndUpdatePrediction() {
         const response = await axios.get(API_URL);
         const rawData = response.data;
 
-        // Log mẫu để debug
-        console.log('📦 Cấu trúc API (sample):', JSON.stringify(rawData).slice(0, 600));
-
         let sessions = extractSessionsArray(rawData);
         if (sessions.length === 0) {
             console.warn('⚠️ Không tìm thấy mảng phiên, giữ nguyên lịch sử');
             if (historyResults.length > 0) {
-                // Vẫn có thể dự đoán từ lịch sử
                 const prediction = makePredictionFromHistory();
                 if (prediction) {
                     latestPrediction = prediction;
@@ -2480,7 +2476,6 @@ async function fetchAndUpdatePrediction() {
                     reasons: ['Dự đoán dựa trên quy luật đảo chiều cơ bản']
                 };
             } else {
-                // Vẫn chưa có dữ liệu gì
                 latestPrediction = createDefaultPrediction();
                 lastUpdateTime = new Date();
                 console.log('ℹ️ Chưa có dữ liệu, dùng mặc định');
@@ -2488,7 +2483,7 @@ async function fetchAndUpdatePrediction() {
             }
         }
 
-        // Lấy thông tin phiên gần nhất (có thể không có kết quả)
+        // Lấy thông tin phiên gần nhất
         const lastSession = sessions[0] || {};
         const phien = getValue(lastSession, ['id', 'session_id', 'sessionId'], 0);
         const phienMoi = phien + 1;
@@ -2499,7 +2494,6 @@ async function fetchAndUpdatePrediction() {
             dice = '0-0-0';
         }
 
-        // Kết quả của phiên gần nhất (có thể là "Chua co")
         const ketQuaRaw = getValue(lastSession, ['result', 'ketqua', 'ket_qua', 'status', 'outcome'], '');
         const ketQua = ketQuaRaw.toUpperCase() === 'T' ? 'Tài' :
                         ketQuaRaw.toUpperCase() === 'X' ? 'Xỉu' : 'Chưa có';
@@ -2560,7 +2554,6 @@ app.get('/latest', (req, res) => {
 
 app.get('/predict', async (req, res) => {
     try {
-        // Gọi API để lấy dữ liệu mới nhất
         await fetchAndUpdatePrediction();
         if (latestPrediction) {
             res.json(latestPrediction);
