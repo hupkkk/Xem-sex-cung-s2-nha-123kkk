@@ -2374,8 +2374,10 @@ app.use(express.json());
 const API_URL = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=15766f58a95cb4f95975ffcf643f524c';
 
 // ---------- BỘ NHỚ LỊCH SỬ ----------
-let historyResults = [];          // Lưu các kết quả T/X đã lấy được
-let lastRawSessions = [];        // Lưu toàn bộ phiên thô để lấy xúc xắc và id
+// Dùng Set để theo dõi id đã xử lý, tránh thêm trùng lặp
+let processedIds = new Set();
+let historyResults = [];   // Mảng kết quả T/X theo thứ tự thời gian (cũ → mới)
+let lastRawSessions = [];  // Phiên thô từ API để trích xuất thông tin hiển thị
 let latestPrediction = null;
 let lastUpdateTime = null;
 let isUpdating = false;
@@ -2386,14 +2388,10 @@ function extractSessionsArray(data) {
     if (Array.isArray(data)) return data;
     const possibleKeys = ['data', 'list', 'results', 'items', 'sessions', 'rows'];
     for (const key of possibleKeys) {
-        if (data[key] && Array.isArray(data[key])) {
-            return data[key];
-        }
+        if (data[key] && Array.isArray(data[key])) return data[key];
     }
     for (const key of Object.keys(data)) {
-        if (Array.isArray(data[key])) {
-            return data[key];
-        }
+        if (Array.isArray(data[key])) return data[key];
     }
     return [];
 }
@@ -2402,149 +2400,198 @@ function extractSessionsArray(data) {
 function getValue(obj, keys, fallback = null) {
     if (!obj || typeof obj !== 'object') return fallback;
     for (const key of keys) {
-        if (obj[key] !== undefined && obj[key] !== null) {
-            return obj[key];
-        }
+        if (obj[key] !== undefined && obj[key] !== null) return obj[key];
     }
     return fallback;
+}
+
+// ---------- HELPER: chuẩn hóa xúc xắc ----------
+function normalizeDice(dice) {
+    if (!dice) return '0-0-0';
+    if (Array.isArray(dice)) return dice.join('-');
+    if (typeof dice === 'string') return dice;
+    if (typeof dice === 'number') return String(dice);
+    return '0-0-0';
+}
+
+// ---------- HELPER: chạy thuật toán dự đoán từ lịch sử ----------
+function runPrediction(history) {
+    if (!history || history.length === 0) return null;
+
+    const system = new UltraDicePredictionSystem();
+    for (const r of history) {
+        system.addResult(r);
+    }
+    let prediction = system.getFinalPrediction();
+
+    // Fallback: nếu thuật toán không đủ dữ liệu, dùng đảo chiều từ phiên cuối
+    if (!prediction) {
+        const last = history[history.length - 1];
+        prediction = {
+            prediction: last === 'T' ? 'X' : 'T',
+            confidence: 0.55,
+            reasons: ['Fallback: đảo chiều từ phiên gần nhất do chưa đủ dữ liệu']
+        };
+    }
+
+    return prediction;
 }
 
 // ---------- HÀM CẬP NHẬT DỰ ĐOÁN ----------
 async function fetchAndUpdatePrediction() {
     if (isUpdating) return;
     isUpdating = true;
+
     try {
         console.log('🔄 Đang gọi API...');
         const response = await axios.get(API_URL);
         const rawData = response.data;
 
-        let sessions = extractSessionsArray(rawData);
+        const sessions = extractSessionsArray(rawData);
+
         if (sessions.length === 0) {
-            console.warn('⚠️ Không tìm thấy mảng phiên, giữ nguyên lịch sử');
+            console.warn('⚠️ Không có phiên nào từ API');
+            // Nếu đã có lịch sử trước đó → vẫn tính dự đoán
             if (historyResults.length > 0) {
-                const prediction = makePredictionFromHistory();
-                if (prediction) {
-                    latestPrediction = prediction;
-                    lastUpdateTime = new Date();
-                    console.log('✅ Dự đoán từ lịch sử (không có phiên mới)');
-                }
+                _buildLatestPrediction(null, null);
             }
             return;
         }
 
-        // Lưu lại toàn bộ phiên thô để lấy thông tin hiển thị
         lastRawSessions = sessions;
 
-        // Lọc phiên có kết quả T/X
-        const newValidSessions = sessions.filter(s => {
-            const result = getValue(s, ['result', 'ketqua', 'ket_qua', 'status', 'outcome'], '').toUpperCase();
-            return result === 'T' || result === 'X';
-        });
+        // ----------------------------------------------------------------
+        // API trả về mảng phiên sắp xếp: sessions[0] là phiên MỚI NHẤT
+        // sessions[0] thường là phiên đang chạy (chưa có kết quả)
+        // sessions[1] trở đi là phiên đã có kết quả
+        //
+        // Chiến lược:
+        //   - Lấy kết quả từ tất cả phiên ĐÃ CÓ KẾT QUẢ (result = T/X)
+        //     để xây dựng lịch sử; dùng id để tránh thêm trùng
+        //   - Phiên hiển thị (Phien, ket_qua, Xuc_xac):
+        //       • Nếu sessions[0] đã có kết quả → dùng sessions[0]
+        //       • Nếu sessions[0] chưa có → dùng sessions[1] (phiên cuối đã xong)
+        //   - Phien_moi: id của sessions[0] + 1 (phiên tiếp theo cần dự đoán)
+        // ----------------------------------------------------------------
 
-        // Cập nhật lịch sử kết quả
-        for (const s of newValidSessions) {
-            const result = getValue(s, ['result', 'ketqua', 'ket_qua', 'status', 'outcome'], '').toUpperCase();
-            if (result && (result === 'T' || result === 'X')) {
-                historyResults.push(result);
+        // Xác định phiên đã hoàn thành gần nhất (để hiển thị kết quả thực tế)
+        let displaySession = null;
+        for (const s of sessions) {
+            const r = getValue(s, ['result', 'ketqua', 'ket_qua', 'status', 'outcome'], '').toUpperCase();
+            if (r === 'T' || r === 'X') {
+                displaySession = s;
+                break; // lấy phiên đầu tiên đã có kết quả
             }
         }
-        // Giới hạn lịch sử 200 phiên
+
+        // Phiên mới nhất (có thể chưa có kết quả) để lấy id cho Phien_moi
+        const newestSession = sessions[0] || {};
+        const newestId = getValue(newestSession, ['id', 'session_id', 'sessionId', 'phien'], 0);
+
+        // Thêm kết quả mới vào lịch sử (chống trùng bằng id)
+        let addedCount = 0;
+        // Đảo ngược để thêm từ cũ → mới
+        const reversed = [...sessions].reverse();
+        for (const s of reversed) {
+            const sid = getValue(s, ['id', 'session_id', 'sessionId', 'phien'], null);
+            const r = getValue(s, ['result', 'ketqua', 'ket_qua', 'status', 'outcome'], '').toUpperCase();
+            if ((r === 'T' || r === 'X') && sid !== null && !processedIds.has(sid)) {
+                processedIds.add(sid);
+                historyResults.push(r);
+                addedCount++;
+            }
+        }
+
+        if (addedCount > 0) {
+            console.log(`➕ Thêm ${addedCount} kết quả mới vào lịch sử`);
+        }
+
+        // Giới hạn lịch sử 200 phiên gần nhất
         if (historyResults.length > 200) {
             historyResults = historyResults.slice(-200);
         }
+        console.log(`📊 Lịch sử: ${historyResults.length} kết quả`);
 
-        console.log(`📊 Lịch sử hiện có: ${historyResults.length} kết quả`);
-
-        // Dùng dữ liệu mới nhất để dự đoán
-        let prediction = null;
-        if (historyResults.length > 0) {
-            const system = new UltraDicePredictionSystem();
-            for (const r of historyResults) {
-                system.addResult(r);
-            }
-            prediction = system.getFinalPrediction();
-        }
-
-        // Fallback nếu không đủ
-        if (!prediction) {
-            if (historyResults.length > 0) {
-                const lastResult = historyResults[historyResults.length - 1];
-                const fallbackPred = lastResult === 'T' ? 'X' : 'T';
-                prediction = {
-                    prediction: fallbackPred,
-                    confidence: 0.55,
-                    reasons: ['Dự đoán dựa trên quy luật đảo chiều cơ bản']
-                };
-            } else {
-                latestPrediction = createDefaultPrediction();
-                lastUpdateTime = new Date();
-                console.log('ℹ️ Chưa có dữ liệu, dùng mặc định');
-                return;
-            }
-        }
-
-        // Lấy thông tin phiên gần nhất
-        const lastSession = sessions[0] || {};
-        const phien = getValue(lastSession, ['id', 'session_id', 'sessionId'], 0);
-        const phienMoi = phien + 1;
-        let dice = getValue(lastSession, ['dice', 'dices', 'xuc_xac', 'numbers', 'value'], [0, 0, 0]);
-        if (Array.isArray(dice)) {
-            dice = dice.join('-');
-        } else if (typeof dice !== 'string') {
-            dice = '0-0-0';
-        }
-
-        const ketQuaRaw = getValue(lastSession, ['result', 'ketqua', 'ket_qua', 'status', 'outcome'], '');
-        const ketQua = ketQuaRaw.toUpperCase() === 'T' ? 'Tài' :
-                        ketQuaRaw.toUpperCase() === 'X' ? 'Xỉu' : 'Chưa có';
-
-        const duDoan = prediction.prediction === 'T' ? 'Tài' : 'Xỉu';
-        const doTinCay = (prediction.confidence * 100).toFixed(2) + '%';
-
-        latestPrediction = {
-            Id: 's2king',
-            Phien: phien,
-            ket_qua: ketQua,
-            Xuc_xac: dice,
-            Phien_moi: phienMoi,
-            Du_doan: duDoan,
-            Do_tin_cay: doTinCay
-        };
-        lastUpdateTime = new Date();
-        console.log(`✅ Cập nhật dự đoán thành công lúc ${lastUpdateTime.toLocaleString()}`);
-        console.log('📊 Dự đoán mới:', latestPrediction);
+        // Xây dựng dự đoán và cập nhật latestPrediction
+        _buildLatestPrediction(displaySession, newestId);
 
     } catch (error) {
-        console.error('❌ Lỗi cập nhật tự động:', error.message);
+        console.error('❌ Lỗi cập nhật:', error.message);
         if (error.response) {
-            console.error('📄 Status:', error.response.status);
+            console.error('   Status HTTP:', error.response.status);
+        }
+        // Nếu đang có lịch sử → vẫn cố tạo dự đoán từ lịch sử cũ
+        if (historyResults.length > 0 && !latestPrediction) {
+            _buildLatestPrediction(null, null);
         }
     } finally {
         isUpdating = false;
     }
 }
 
-function createDefaultPrediction() {
-    return {
+// ---------- XÂY DỰNG latestPrediction ----------
+function _buildLatestPrediction(displaySession, newestId) {
+    // Chạy thuật toán dự đoán
+    const prediction = runPrediction(historyResults);
+
+    if (!prediction) {
+        // Hoàn toàn không có dữ liệu: không đặt giá trị cứng, chỉ báo lỗi
+        console.warn('⚠️ Chưa đủ dữ liệu để dự đoán');
+        return;
+    }
+
+    // Thông tin phiên vừa hoàn thành
+    let phien = 0;
+    let ketQua = 'Chưa có';
+    let xucXac = '0-0-0';
+
+    if (displaySession) {
+        phien = getValue(displaySession, ['id', 'session_id', 'sessionId', 'phien'], 0);
+        const ketQuaRaw = getValue(displaySession, ['result', 'ketqua', 'ket_qua', 'status', 'outcome'], '');
+        ketQua = ketQuaRaw.toUpperCase() === 'T' ? 'Tài'
+               : ketQuaRaw.toUpperCase() === 'X' ? 'Xỉu'
+               : 'Chưa có';
+        const rawDice = getValue(displaySession,
+            ['dice', 'dices', 'xuc_xac', 'numbers', 'value', 'xucxac'], null);
+        xucXac = normalizeDice(rawDice);
+    }
+
+    // Phiên mới cần dự đoán = id phiên mới nhất + 1
+    // Nếu newestId là id phiên đang chạy → +1 là phiên sau đó
+    // Nếu displaySession cũng là newestSession → phienMoi = phien + 1
+    const baseId = (newestId !== null && newestId !== undefined) ? newestId : phien;
+    const phienMoi = Number(baseId) + 1;
+
+    const duDoan = prediction.prediction === 'T' ? 'Tài' : 'Xỉu';
+    const doTinCay = (prediction.confidence * 100).toFixed(2) + '%';
+
+    latestPrediction = {
         Id: 's2king',
-        Phien: 0,
-        ket_qua: 'Chưa có',
-        Xuc_xac: '0-0-0',
-        Phien_moi: 1,
-        Du_doan: 'Tài',
-        Do_tin_cay: '50.00%'
+        Phien: phien,
+        ket_qua: ketQua,
+        Xuc_xac: xucXac,
+        Phien_moi: phienMoi,
+        Du_doan: duDoan,
+        Do_tin_cay: doTinCay
     };
+    lastUpdateTime = new Date();
+
+    console.log(`✅ Dự đoán cập nhật lúc ${lastUpdateTime.toLocaleTimeString()}:`, latestPrediction);
 }
 
-// Lần đầu chạy
+// ---------- KHỞI ĐỘNG ----------
+// Chạy ngay sau 1 giây rồi lặp mỗi 30 giây
 setTimeout(fetchAndUpdatePrediction, 1000);
 setInterval(fetchAndUpdatePrediction, AUTO_UPDATE_INTERVAL);
 
 // ---------- ENDPOINTS ----------
 
+// GET /latest – trả về dự đoán mới nhất đã tính sẵn (nhanh)
 app.get('/latest', (req, res) => {
     if (!latestPrediction) {
-        return res.status(503).json({ error: 'Chưa có dự đoán, vui lòng đợi vài giây' });
+        return res.status(503).json({
+            error: 'Chưa có dự đoán, server đang khởi động – vui lòng thử lại sau vài giây'
+        });
     }
     res.json({
         ...latestPrediction,
@@ -2552,13 +2599,17 @@ app.get('/latest', (req, res) => {
     });
 });
 
+// GET /predict – gọi API ngay lập tức rồi trả kết quả (chậm hơn)
 app.get('/predict', async (req, res) => {
     try {
         await fetchAndUpdatePrediction();
         if (latestPrediction) {
-            res.json(latestPrediction);
+            res.json({
+                ...latestPrediction,
+                last_update: lastUpdateTime ? lastUpdateTime.toISOString() : null
+            });
         } else {
-            res.json(createDefaultPrediction());
+            res.status(503).json({ error: 'Chưa đủ dữ liệu để dự đoán' });
         }
     } catch (error) {
         console.error('Lỗi /predict:', error.message);
@@ -2566,11 +2617,13 @@ app.get('/predict', async (req, res) => {
     }
 });
 
+// GET /status – thông tin chi tiết trạng thái server
 app.get('/status', (req, res) => {
     res.json({
         status: 'running',
         last_update: lastUpdateTime ? lastUpdateTime.toISOString() : null,
         history_count: historyResults.length,
+        processed_sessions: processedIds.size,
         latest_prediction: latestPrediction || null,
         auto_update_interval: AUTO_UPDATE_INTERVAL / 1000 + 's'
     });
@@ -2578,8 +2631,8 @@ app.get('/status', (req, res) => {
 
 app.listen(port, () => {
     console.log(`🚀 Server đang chạy tại http://localhost:${port}`);
-    console.log(`📡 Tự động cập nhật mỗi ${AUTO_UPDATE_INTERVAL/1000} giây`);
-    console.log(`📌 Endpoint /latest để lấy dự đoán mới nhất`);
-    console.log(`📌 Endpoint /predict để gọi API trực tiếp`);
-    console.log(`📌 Endpoint /status để xem trạng thái`);
+    console.log(`📡 Tự động cập nhật mỗi ${AUTO_UPDATE_INTERVAL / 1000} giây`);
+    console.log(`📌 /latest  – dự đoán mới nhất (đọc cache)`);
+    console.log(`📌 /predict – gọi API trực tiếp rồi dự đoán`);
+    console.log(`📌 /status  – trạng thái server`);
 });
